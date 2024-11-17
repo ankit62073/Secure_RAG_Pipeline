@@ -181,13 +181,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Built with Python
 - Thanks to all contributors!
 
-## 📞 Support
-
-For support:
-1. Check documentation
-2. Search existing issues
-3. Create new issue if needed
-
 ---
 
 
