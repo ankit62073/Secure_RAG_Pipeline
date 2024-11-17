@@ -55,8 +55,8 @@ flowchart TD
             RG[Response Generator LLM]
             subgraph Levels["Output Levels"]
                 L1[Junior Level]
-                L2[Standard Level]
-                L3[Expert Level]
+                
+                L3[Senior Level]
             end
         end
     end
@@ -79,7 +79,7 @@ flowchart TD
     RP --> SL
     SL --> RG
     RG --> L1
-    RG --> L2
+    
     RG --> L3
     
     SQ --> QE
@@ -87,7 +87,7 @@ flowchart TD
     DB --> TR
     
     L1 --> UI
-    L2 --> UI
+    
     L3 --> UI
     TR --> UI
 ```
