@@ -1,0 +1,616 @@
+"""
+Semantic enrichment:
+• generates docstrings with GPT
+• builds embeddings with sentence-transformers
+• writes results back to Neo4j
+
+Now relies on the global driver defined in app.configs.neo4j_setup
+instead of opening a new driver each time.
+"""
+
+from __future__ import annotations
+
+import os, re, json, time, logging, asyncio
+from dataclasses import dataclass
+from typing import List, Dict
+
+from sentence_transformers import SentenceTransformer
+import openai
+from dotenv import load_dotenv
+
+# ─── Global Neo4j utilities ────────────────────────────────────
+from app.configs.neo4j_setup import get_driver                   # singleton pool
+from app.ai.utils.neo4j_utils import retry_on_connection_error   # auto-refresh
+
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+# ─── Small data helpers ────────────────────────────────────────
+@dataclass
+class DocstringRequest:
+    node_id: str
+    text: str
+
+
+@dataclass
+class DocstringData:
+    node_id: str
+    docstring: str
+    tags: List[str]
+
+
+@dataclass
+class DocstringResponse:
+    docstrings: List[DocstringData]
+
+
+# ─── Main class ────────────────────────────────────────────────
+class SemanticEnrichment:
+    """
+    Uses the global Neo4j driver. The constructor keeps the old
+    uri / username / password parameters so existing call-sites
+    don’t break, but they are ignored.
+    """
+
+    def __init__(
+        self,
+        uri: str | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        neo_db: str | None = None,
+        per_node_limit: int | None = None,
+    ) -> None:
+        try:
+            # Embedding + OpenAI
+            self.embedding_model   = SentenceTransformer("all-mpnet-base-v2")
+            self.gpt_model         = os.getenv("OPENAI_MODEL")
+            self.openai_client     = openai.AsyncOpenAI(
+                api_key=os.getenv("OPENAI_API_KEY")
+            )
+
+            self.parallel_requests = int(os.getenv("PARALLEL_REQUESTS", "10"))
+            self.per_node_limit    = per_node_limit or int(os.getenv("PER_NODE_LIMIT", "10"))
+
+            # Neo4j
+            self.driver           = get_driver()                        # global pool
+            self.neo4j_database   = neo_db or os.getenv("NEO4J_DEFAULT_DB", "neo4j")
+
+            if not self.verify_connection():
+                raise ConnectionError("Failed to connect to Neo4j")
+
+            self._setup_vector_indexes()
+
+        except Exception as exc:
+            logger.error(f"[SemanticEnrich] init failed: {exc}")
+            raise
+
+    # ── Connectivity helpers ──────────────────────────────────
+    def verify_connection(self) -> bool:
+        try:
+            with self.driver.session(database=self.neo4j_database) as s:
+                return s.run("RETURN 1 as ok").single().get("ok") == 1
+        except Exception as exc:
+            logger.error(f"[SemanticEnrich] connectivity check failed: {exc}")
+            return False
+
+    @retry_on_connection_error()
+    def _setup_vector_indexes(self) -> None:
+        vec_labels = [
+            ("class_vector_index",     "CLASS"),
+            ("function_vector_index",  "FUNCTION"),
+            ("method_vector_index",    "METHOD"),
+            ("interface_vector_index", "INTERFACE"),
+        ]
+        full_text_stmt = """
+        CREATE FULLTEXT INDEX code_fulltext_index IF NOT EXISTS
+        FOR (n:CLASS|FUNCTION|METHOD|INTERFACE|FILE)
+        ON EACH [n.name, n.content, n.text, n.docstring]
+        """
+
+        with self.driver.session(database=self.neo4j_database) as s:
+            existing = {r["name"]: r["type"] for r in s.run("SHOW INDEXES YIELD name, type")}
+            for name, label in vec_labels:
+                if name not in existing:
+                    logger.info(f"[Neo4j] creating vector index {name}")
+                    s.run(f"""
+                        CREATE VECTOR INDEX {name} IF NOT EXISTS
+                        FOR (n:{label}) ON (n.embedding)
+                        OPTIONS {{
+                          indexConfig: {{
+                            `vector.dimensions`: 768,
+                            `vector.similarity_function`: 'cosine'
+                          }}
+                        }}""")
+            if "code_fulltext_index" not in existing:
+                logger.info("[Neo4j] creating full-text index code_fulltext_index")
+                s.run(full_text_stmt)
+
+    # ── Public helpers (unchanged logic) ───────────────────────
+    def log_graph_stats(self, repo_id: str) -> None:
+        q = """
+        MATCH (n)
+        WHERE n.repoId = $id OR n.repo_id = $id
+        OPTIONAL MATCH (n)-[r]-()
+        RETURN COUNT(DISTINCT n) AS nodes, COUNT(DISTINCT r) AS rels
+        """
+        try:
+            with self.driver.session(database=self.neo4j_database) as s:
+                rec = s.run(q, id=repo_id).single()
+                logger.info(f"[Neo4j] repo {repo_id}: {rec['nodes']} nodes, {rec['rels']} rels")
+        except Exception as exc:
+            logger.error(f"[Neo4j] stats error: {exc}")
+
+    async def generate_embedding(self, text: str) -> List[float]:
+        text = text.strip()
+        if not text:
+            return []
+        loop = asyncio.get_event_loop()
+        emb  = await loop.run_in_executor(
+            None, lambda: self.embedding_model.encode(text, convert_to_numpy=True, show_progress_bar=False)
+        )
+        return emb.tolist()
+
+    async def generate_tags(self, text: str) -> List[str]:
+        delay, retries = 1, 5
+        for attempt in range(retries):
+            try:
+                resp = await self.openai_client.chat.completions.create(
+                    model=self.gpt_model,
+                    messages=[
+                        {"role": "system",
+                         "content": "You are a code analysis assistant. "
+                                    "Return a comma-separated list of tags."},
+                        {"role": "user", "content": text}
+                    ],
+                    max_tokens=100, temperature=0.3,
+                )
+                return [t.strip() for t in resp.choices[0].message.content.split(",")]
+            except openai.RateLimitError:
+                logger.info(f"Rate-limit; retry {attempt+1}/{retries}")
+                await asyncio.sleep(delay)
+                delay *= 2
+            except Exception as exc:
+                logger.error(f"Tag generation error: {exc}")
+                return []
+        raise RuntimeError("Max retries exceeded for tag generation")
+
+    async def process_node_batch(self, batch: List[Dict]) -> List[DocstringData]:
+        
+        semaphore = asyncio.Semaphore(self.per_node_limit or 10)  # Control per-node concurrency
+        results = []
+        successful = 0
+        failed = 0
+
+        async def process_node(node):
+            nonlocal successful, failed
+            
+            async with semaphore:
+                try:
+                    node_id = node.get('node_id')
+                    if not node_id:
+                        logger.warning(f"Skipping node without ID")
+                        failed += 1
+                        return None
+                    
+                    # Log start of processing
+                    logger.debug(f"Processing node: {node_id}")
+                    
+                    # If node has existing docstring, use it and just generate tags
+                    existing_docstring = node.get('existing_docstring')
+                    if existing_docstring:
+                        
+                        get_text = node.get('content', '')
+                        
+                        if not get_text:
+                            get_text = node.get('text', '')
+                        
+                        text = f"{existing_docstring}\n{get_text}"
+                        
+                        tags = await self.generate_tags(text)
+                        successful += 1
+                        return DocstringData(
+                            node_id=node_id,
+                            docstring=existing_docstring,
+                            tags=tags or []
+                        )
+                    else:
+                        # Generate new docstrings with LLM
+                        try:
+                            
+                            get_text = node.get('content', '')
+                        
+                            if not get_text:
+                                get_text = node.get('text', '')
+                                
+                            response = await self.generate_response([DocstringRequest(
+                                node_id=node_id,
+                                text=get_text
+                            )])
+                            
+                            if response and response.docstrings and len(response.docstrings) > 0:
+                                successful += 1
+                                return response.docstrings[0]
+                            else:
+                                logger.warning(f"No docstring generated for node {node_id}")
+                                failed += 1
+                                return None
+                        except Exception as e:
+                            logger.error(f"Error generating docstring for node {node_id}: {str(e)}")
+                            failed += 1
+                            return None
+                except Exception as e:
+                    logger.error(f"Error processing node: {str(e)}")
+                    failed += 1
+                    return None
+
+        # Process all nodes in parallel with controlled concurrency
+        start_time = asyncio.get_event_loop().time()
+        tasks = [process_node(node) for node in batch]
+        node_results = await asyncio.gather(*tasks, return_exceptions=False)
+        
+        # Filter out None results
+        results = [r for r in node_results if r is not None]
+        
+        # Log statistics
+        elapsed = asyncio.get_event_loop().time() - start_time
+        logger.info(f"Processed {len(batch)} nodes in {elapsed:.2f}s: {successful} successful, {failed} failed")
+        
+        return results
+
+    async def generate_docstrings(self, repo_id: str) -> Dict[str, DocstringResponse]:
+        
+        if not self.driver:
+            raise ValueError("Neo4j connection not initialized")
+
+        try:
+            # Log graph statistics for debugging
+            self.log_graph_stats(repo_id)
+            
+            # Verify connection is active
+            if not self.verify_connection():
+                logger.error("Neo4j connection failed verification")
+                raise ConnectionError("Neo4j connection is not active")
+            
+            # Get nodes that need enrichment
+            nodes = self.get_nodes_for_enrichment()
+            total_nodes = len(nodes)
+            logger.info(f"Found {total_nodes} nodes for enrichment in repository {repo_id}")
+
+            if not nodes:
+                logger.info("No nodes require enrichment")
+                return {"docstrings": []}
+
+            # Configure batching and concurrency
+            batch_size = min(100, max(10, total_nodes // 10))  # Dynamic batch sizing
+            max_concurrent_batches = min(self.parallel_requests, 20)
+            semaphore = asyncio.Semaphore(max_concurrent_batches)
+            total_batches = (total_nodes + batch_size - 1) // batch_size
+            all_docstrings = {"docstrings": []}
+
+            logger.info(f"Processing in {total_batches} batches with max {max_concurrent_batches} concurrent batches")
+            logger.info(f"Using semaphore limit of {self.per_node_limit} for node-level operations")
+
+            async def process_batch(batch_idx: int, batch_data: List[Dict]):
+                batch_num = batch_idx + 1
+                async with semaphore:
+                    try:
+                        logger.info(f"[Batch {batch_num}/{total_batches}] Started with {len(batch_data)} nodes")
+                        start = asyncio.get_event_loop().time()
+                        
+                        docstrings = await self.process_node_batch(batch_data)
+
+                        if docstrings:
+                            await self.update_nodes_in_graph(repo_id, DocstringResponse(docstrings=docstrings))
+                            elapsed = asyncio.get_event_loop().time() - start
+                            logger.info(f"[Batch {batch_num}/{total_batches}] Updated {len(docstrings)} nodes in {elapsed:.2f}s ({len(docstrings)/elapsed:.2f} nodes/s)")
+                            return docstrings
+                        else:
+                            logger.warning(f"[Batch {batch_num}/{total_batches}] No docstrings generated")
+                            return []
+                    except Exception as e:
+                        logger.error(f"[Batch {batch_num}/{total_batches}] Failed: {e}")
+                        # Don't completely fail on a single batch error
+                        return []
+
+            # Schedule batch processing tasks
+            tasks = [
+                process_batch(i // batch_size, nodes[i:i + batch_size])
+                for i in range(0, total_nodes, batch_size)
+            ]
+
+            # Process batches with controlled concurrency
+            start_time = asyncio.get_event_loop().time()
+            batch_results = await asyncio.gather(*tasks, return_exceptions=False)
+            total_time = asyncio.get_event_loop().time() - start_time
+
+            # Collect all results
+            successful_nodes = 0
+            for result in batch_results:
+                if result:
+                    all_docstrings["docstrings"].extend(result)
+                    successful_nodes += len(result)
+
+            # Log completion statistics
+            if total_time > 0:
+                nodes_per_second = successful_nodes / total_time
+                logger.info(f"Enrichment complete: {successful_nodes}/{total_nodes} nodes enriched in {total_time:.2f}s")
+                logger.info(f"Processing rate: {nodes_per_second:.2f} nodes/second")
+            else:
+                logger.info(f"Enrichment complete: {successful_nodes}/{total_nodes} nodes enriched")
+            
+            return all_docstrings
+
+        except Exception as e:
+            logger.error(f"Fatal enrichment error: {e}")
+            raise
+
+    async def generate_response(self, batch: List[DocstringRequest]) -> DocstringResponse:
+        
+        base_prompt = """
+        You are a senior software engineer with expertise in code analysis and documentation. Your task is to generate concise, high-quality docstrings for each code snippet and assign meaningful tags based on its purpose. Approach this task methodically, following these steps:
+
+        1. **Write a Concise Docstring**:
+            - Begin with a clear one-line summary of the code's purpose
+            - Add 1-2 additional sentences describing functionality and usage
+            - Focus on being informative rather than descriptive
+            - Include important technical details but avoid unnecessary implementation specifics
+            - Use proper technical terminology appropriate for the codebase
+
+        2. **Assign Specific Tags**:
+            - Choose from these tag categories based on code type:
+
+            **Backend Tags**:
+            - AUTH: Authentication/authorization
+            - DATABASE: Database interactions
+            - API: API endpoints/handlers
+            - UTILITY: Helper/utility functions
+            - PRODUCER: Message producer (queues/topics)
+            - CONSUMER: Message consumer (queues/topics)
+            - EXTERNAL_SERVICE: External service integration
+            - CONFIGURATION: Configuration management
+
+            **Frontend Tags**:
+            - UI_COMPONENT: Visual UI component
+            - FORM_HANDLING: Form data handling
+            - STATE_MANAGEMENT: State management
+            - DATA_BINDING: Data binding
+            - ROUTING: Navigation/routing
+            - EVENT_HANDLING: User interaction handling
+            - STYLING: Styling/theming
+            - MEDIA: Media handling
+            - ANIMATION: Animation
+            - ACCESSIBILITY: Accessibility features
+            - DATA_FETCHING: Data retrieval
+
+            **Shared Tags**:
+            - ERROR_HANDLING: Error handling/validation
+            - TESTING: Testing utilities
+            - SECURITY: Security mechanisms
+            - PERFORMANCE: Performance optimization
+            - LOGGING: Logging functionality
+
+        Your response must be a valid JSON object containing a list of docstrings, where each docstring object has:
+        - node_id: The ID of the node being documented
+        - docstring: A concise description of the code's purpose and functionality
+        - tags: A list of relevant tags from the categories above (choose 1-5 most relevant tags)
+
+        Here are the code snippets:
+
+        {code_snippets}
+        """
+
+        # Prepare the code snippets
+        code_snippets = ""
+        for request in batch:
+            code_snippets += f"node_id: {request.node_id} \n```\n{request.text}\n```\n\n "
+
+        messages = [
+            {
+                "role": "system",
+                "content": "You are an expert software documentation assistant specialized in analyzing code and providing structured documentation in JSON format."
+            },
+            {
+                "role": "user",
+                "content": base_prompt.format(code_snippets=code_snippets)
+            }
+        ]
+        
+        retry_delay = 1
+        max_retries = 5
+         
+        for attempt in range(max_retries):
+            try :
+                
+                response = await self.openai_client.chat.completions.create(
+                    model=self.gpt_model,
+                    messages=messages,
+                    temperature=0.2,
+                    response_format={"type": "json_object"}
+                )
+            
+                content = response.choices[0].message.content.strip()
+                result = self._parse_json_response(content)
+                
+                return result
+                
+            except openai.RateLimitError as e:
+                logger.info(f"Rate limit exceeded. Retrying in {retry_delay} seconds... (Attempt {attempt + 1}/{max_retries})")
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+                
+            except Exception as e:
+                logger.error(f"Failed to generate docstring due to error: {e}")
+                return []
+                    
+        raise Exception("Failed after multiple retries.")
+    
+    def _parse_json_response(self, content: str) -> DocstringResponse:
+        """Parse JSON response from LLM and convert to DocstringResponse."""
+        try:
+            # Clean up any potential markdown formatting
+            content = re.sub(r'^```json', '', content)
+            content = re.sub(r'^```', '', content)
+            content = re.sub(r'```$', '', content)
+            content = content.strip()
+            
+            data = json.loads(content)
+            docstrings = []
+            
+            for item in data.get("docstrings", []):
+                if "node_id" in item and "docstring" in item:
+                    # Ensure tags is a list
+                    tags = item.get("tags", [])
+                    if isinstance(tags, str):
+                        tags = [tag.strip() for tag in tags.split(",")]
+                    
+                    docstrings.append(DocstringData(
+                        node_id=item["node_id"],
+                        docstring=item["docstring"],
+                        tags=tags
+                    ))
+            
+            return DocstringResponse(docstrings=docstrings)
+        except Exception as e:
+            logger.error(f"Failed to parse JSON response: {e}")
+            return DocstringResponse(docstrings=[])
+
+    def get_nodes_for_enrichment(self) -> List[Dict]:
+        """Retrieve all nodes that need semantic enrichment (with or without docstrings)."""
+        try:
+            if not self.driver:
+                raise ValueError("Neo4j connection not initialized")
+                
+            with self.driver.session(database=self.neo4j_database) as session:
+                result = session.run("""
+                    MATCH (n)
+                    WHERE (n:CLASS OR n:FUNCTION OR n:METHOD OR n:INTERFACE)
+                    AND (
+                        n.docstring IS NULL OR 
+                        n.docstring = '' OR 
+                        n.embedding IS NULL OR 
+                        n.tags IS NULL OR 
+                        size(n.tags) = 0
+                    )
+                    RETURN n.node_id as node_id, 
+                           n.content as text,
+                           n.docstring as existing_docstring
+                """)
+                nodes = [dict(record) for record in result]
+                nodes_without_docstring = [n for n in nodes if not n.get('existing_docstring')]
+                nodes_with_docstring = [n for n in nodes if n.get('existing_docstring')]
+                
+                logger.info(f"Found {len(nodes_without_docstring)} nodes needing docstring generation")
+                logger.info(f"Found {len(nodes_with_docstring)} nodes with docstrings needing enrichment")
+                return nodes
+        except Exception as e:
+            logger.error(f"Failed to retrieve nodes: {e}")
+            return []
+
+    async def update_nodes_in_graph(self, repo_id: str, response: DocstringResponse) -> None:
+        
+        if not self.driver:
+            raise ValueError("Neo4j connection not initialized")
+            
+        try:
+            # Verify connection is still active
+            if not self.verify_connection():
+                logger.error("Neo4j connection lost during update")
+                raise ConnectionError("Neo4j connection is not active")
+            
+            with self.driver.session(database=self.neo4j_database) as session:
+                batch_size = 50  # Smaller batches for better transaction management
+                total_updates = len(response.docstrings)
+                total_batches = (total_updates + batch_size - 1) // batch_size
+                
+                logger.info(f"Updating {total_updates} nodes in {total_batches} batches")
+                
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, total_updates)
+                    batch = response.docstrings[start_idx:end_idx]
+                    
+                    successful_updates = 0
+                    failed_updates = 0
+                    
+                    start_time = time.time()
+                    
+                    # Process each node in the batch
+                    for doc in batch:
+                        try:
+                            # Get the node's content
+                            content_result = session.run("""
+                                MATCH (n)
+                                WHERE n.node_id = $node_id
+                                RETURN n.content as content
+                            """, {"node_id": doc.node_id}).single()
+                            
+                            if not content_result or not content_result.get("content"):
+                                logger.error(f"Could not find content for node {doc.node_id}")
+                                failed_updates += 1
+                                continue
+                            
+                            # Use both code and docstring for embedding to improve semantic search
+                            text = f"{doc.docstring}\n{content_result['content']}".strip()
+                            embedding = await self.generate_embedding(text)
+                            
+                            if not embedding:
+                                logger.error(f"Failed to generate embedding for node {doc.node_id}")
+                                failed_updates += 1
+                                continue
+                            
+                            if not doc.tags or len(doc.tags) == 0:
+                                # Generate tags if none exist
+                                doc.tags = await self.generate_tags(text)
+                            
+                            # Ensure arrays are properly formatted for Neo4j
+                            embedding_list = list(map(float, embedding))
+                            tags_list = list(map(str, doc.tags))
+                            
+                            # Update node with a single atomic operation
+                            result = session.run("""
+                                MATCH (n)
+                                WHERE n.node_id = $node_id
+                                SET n.docstring = $docstring,
+                                    n.embedding = $embedding,
+                                    n.tags = $tags,
+                                    n.last_updated = datetime()
+                                RETURN n.docstring IS NOT NULL as has_doc,
+                                       n.embedding IS NOT NULL as has_emb,
+                                       n.tags IS NOT NULL as has_tags
+                            """, {
+                                "node_id": doc.node_id,
+                                "docstring": doc.docstring,
+                                "embedding": embedding_list,
+                                "tags": tags_list
+                            })
+                            
+                            record = result.single()
+                            if record and all([record["has_doc"], record["has_emb"], record["has_tags"]]):
+                                successful_updates += 1
+                                logger.debug(f"Successfully updated node {doc.node_id}")
+                            else:
+                                logger.error(f"Failed to verify update for node {doc.node_id}")
+                                failed_updates += 1
+                        
+                        except Exception as e:
+                            logger.error(f"Error updating node {doc.node_id}: {str(e)}")
+                            failed_updates += 1
+                            continue
+                    
+                    elapsed = time.time() - start_time
+                    logger.info(
+                        f"Batch {batch_idx+1}/{total_batches}: "
+                        f"Updated {successful_updates}/{len(batch)} nodes in {elapsed:.2f}s "
+                        f"({successful_updates/elapsed:.2f} nodes/s if {failed_updates} failed)"
+                    )
+                
+                # Final statistics
+                logger.info(f"Graph update complete for repository {repo_id}")
+                
+        except Exception as e:
+            logger.error(f"Failed to update nodes in graph: {e}")
+            raise
+
+    def close(self):
+        """No-op: driver is managed globally in neo4j_setup."""
+        pass
